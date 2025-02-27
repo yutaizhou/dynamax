@@ -1,32 +1,39 @@
 """
 Extended Kalman filtering and smoothing for nonlinear Gaussian state-space models.
 """
-import jax.numpy as jnp
-import jax.random as jr
-from jax import lax
-from jax import jacfwd
-from tensorflow_probability.substrates.jax.distributions import MultivariateNormalFullCovariance as MVN
-from jaxtyping import Array, Float
+
 from typing import Callable, List, Optional, Tuple
 
-from dynamax.utils.utils import psd_solve, symmetrize
+import jax.numpy as jnp
+import jax.random as jr
+from jax import jacfwd, lax
+from jaxtyping import Array, Float
+from tensorflow_probability.substrates.jax.distributions import (
+    MultivariateNormalFullCovariance as MVN,
+)
+
+from dynamax.linear_gaussian_ssm.inference import (
+    PosteriorGSSMFiltered,
+    PosteriorGSSMSmoothed,
+)
 from dynamax.nonlinear_gaussian_ssm.models import ParamsNLGSSM
-from dynamax.linear_gaussian_ssm.inference import PosteriorGSSMFiltered, PosteriorGSSMSmoothed
 from dynamax.types import PRNGKeyT
+from dynamax.utils.utils import psd_solve, symmetrize
 
 # Helper functions
 _get_params = lambda x, dim, t: x[t] if x.ndim == dim + 1 else x
 _process_fn = lambda f, u: (lambda x, y: f(x)) if u is None else f
-_process_input = lambda x, y: jnp.zeros((y,1)) if x is None else x
+_process_input = lambda x, y: jnp.zeros((y, 1)) if x is None else x
 
 
-def _predict(prior_mean: Float[Array, " state_dim"], 
-             prior_cov: Float[Array, "state_dim state_dim"],
-             dynamics_func: Callable, 
-             dynamics_jacobian: Callable, 
-             dynamics_cov: Float[Array, "state_dim state_dim"],
-             inpt: Float[Array, " input_dim"]
-             ) -> Tuple[Float[Array, " state_dim"], Float[Array, "state_dim state_dim"]]:
+def _predict(
+    prior_mean: Float[Array, " state_dim"],
+    prior_cov: Float[Array, "state_dim state_dim"],
+    dynamics_func: Callable,
+    dynamics_jacobian: Callable,
+    dynamics_cov: Float[Array, "state_dim state_dim"],
+    inpt: Float[Array, " input_dim"],
+) -> Tuple[Float[Array, " state_dim"], Float[Array, "state_dim state_dim"]]:
     r"""Predict next mean and covariance using first-order additive EKF
 
         p(z_{t+1}) = \int N(z_t | m, S) N(z_{t+1} | f(z_t, u), Q)
@@ -42,39 +49,52 @@ def _predict(prior_mean: Float[Array, " state_dim"],
     return mu_pred, Sigma_pred
 
 
-def _condition_on(prior_mean: Float[Array, " state_dim"],
-                  prior_cov: Float[Array, "state_dim state_dim"],
-                  emission_func: Callable, 
-                  emission_jacobian: Callable, 
-                  emission_cov: Float[Array, "emission_dim emission_dim"],
-                  inpt: Float[Array, " input_dim"],
-                  emission: Float[Array, " emission_dim"],
-                  num_iter: int):
+def _condition_on(
+    prior_mean: Float[Array, " state_dim"],
+    prior_cov: Float[Array, "state_dim state_dim"],
+    emission_func: Callable,
+    emission_jacobian: Callable,
+    emission_cov: Float[Array, "emission_dim emission_dim"],
+    inpt: Float[Array, " input_dim"],
+    emission: Float[Array, " emission_dim"],
+    num_iter: int,
+):
     r"""Condition a Gaussian potential on a new observation.
 
-       p(z_t | y_t, u_t, y_{1:t-1}, u_{1:t-1})
-         propto p(z_t | y_{1:t-1}, u_{1:t-1}) p(y_t | z_t, u_t)
-         = N(z_t | m, S) N(y_t | h_t(z_t, u_t), R_t)
-         = N(z_t | mm, SS)
-     where
-         mm = m + K*(y - yhat) = mu_cond
-         yhat = h(m, u)
-         S = R + H(m,u) * P * H(m,u)'
-         K = P * H(m, u)' * S^{-1}
-         SS = P - K * S * K' = Sigma_cond
-     **Note! This can be done more efficiently when R is diagonal.**
+      p(z_t | y_t, u_t, y_{1:t-1}, u_{1:t-1})
+        propto p(z_t | y_{1:t-1}, u_{1:t-1}) p(y_t | z_t, u_t)
+        = N(z_t | m, S) N(y_t | h_t(z_t, u_t), R_t)
+        = N(z_t | mm, SS)
+    where
+        mm = m + K*(y - yhat) = mu_cond
+        yhat = h(m, u)
+        S = R + H(m,u) * P * H(m,u)'
+        K = P * H(m, u)' * S^{-1}
+        SS = P - K * S * K' = Sigma_cond
+    **Note! This can be done more efficiently when R is diagonal.**
 
-     Returns:
-         mu_cond (D_hid,): filtered mean.
-         Sigma_cond (D_hid,D_hid): filtered covariance.
+      Returns:
+          mu_cond (D_hid,): filtered mean.
+          Sigma_cond (D_hid,D_hid): filtered covariance.
     """
+
     def _step(carry, _):
         """Iteratively re-linearize around posterior mean and covariance."""
         prior_mean, prior_cov = carry
         H_x = emission_jacobian(prior_mean, inpt)
-        S = emission_cov + H_x @ prior_cov @ H_x.T
-        K = psd_solve(S, H_x @ prior_cov).T
-        posterior_cov = prior_cov - K @ S @ K.T
+
+        # * original dynamax code
+        # S = emission_cov + H_x @ prior_cov @ H_x.T
+        # K = psd_solve(S, H_x @ prior_cov).T
+        # posterior_cov = prior_cov - K @ S @ K.T
+
+        # * Joseph Form: taken from JSL for subspace neural bandits.
+        # * S doesn't do much. K and posterior_cov resulted in better performance.
+        I = jnp.eye(prior_mean.shape[0])
+        S = emission_cov + H_x @ prior_cov @ H_x.T + jnp.eye(emission_cov.shape[0]) * 1e-3
+        K = prior_cov @ H_x.T @ jnp.linalg.inv(S)
+        posterior_cov = (I - K @ H_x) @ prior_cov @ (I - K @ H_x).T + K @ emission_cov @ K.T
+
         posterior_mean = prior_mean + K @ (emission - emission_func(prior_mean, inpt))
         return (posterior_mean, posterior_cov), None
 
@@ -84,15 +104,18 @@ def _condition_on(prior_mean: Float[Array, " state_dim"],
     return mu_cond, symmetrize(Sigma_cond)
 
 
-def extended_kalman_filter(params: ParamsNLGSSM,
-                           emissions: Float[Array, "num_timesteps emission_dim"],
-                           inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
-                           num_iter: int = 1,
-                           output_fields: Optional[List[str]]=["filtered_means", 
-                                                               "filtered_covariances", 
-                                                               "predicted_means", 
-                                                               "predicted_covariances"],
-                           ) -> PosteriorGSSMFiltered:
+def extended_kalman_filter(
+    params: ParamsNLGSSM,
+    emissions: Float[Array, "num_timesteps emission_dim"],
+    inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
+    num_iter: int = 1,
+    output_fields: Optional[List[str]] = [
+        "filtered_means",
+        "filtered_covariances",
+        "predicted_means",
+        "predicted_covariances",
+    ],
+) -> PosteriorGSSMFiltered:
     r"""Run an (iterated) extended Kalman filter to produce the
     marginal likelihood and filtered state estimates.
 
@@ -160,11 +183,12 @@ def extended_kalman_filter(params: ParamsNLGSSM,
     return posterior_filtered
 
 
-def extended_kalman_smoother(params: ParamsNLGSSM,
-                             emissions:  Float[Array, "num_timesteps emission_dim"],
-                             filtered_posterior: Optional[PosteriorGSSMFiltered] = None,
-                             inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None
-                             ) -> PosteriorGSSMSmoothed:
+def extended_kalman_smoother(
+    params: ParamsNLGSSM,
+    emissions: Float[Array, "num_timesteps emission_dim"],
+    filtered_posterior: Optional[PosteriorGSSMFiltered] = None,
+    inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
+) -> PosteriorGSSMSmoothed:
     r"""Run an extended Kalman (RTS) smoother.
 
     Args:
@@ -236,11 +260,12 @@ def extended_kalman_smoother(params: ParamsNLGSSM,
     )
 
 
-def extended_kalman_posterior_sample(key: PRNGKeyT,
-                                     params: ParamsNLGSSM,
-                                     emissions:  Float[Array, "num_timesteps emission_dim"],
-                                     inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None
-                                     ) -> Float[Array, "num_timesteps state_dim"]:
+def extended_kalman_posterior_sample(
+    key: PRNGKeyT,
+    params: ParamsNLGSSM,
+    emissions: Float[Array, "num_timesteps emission_dim"],
+    inputs: Optional[Float[Array, "num_timesteps input_dim"]] = None,
+) -> Float[Array, "num_timesteps state_dim"]:
     r"""Run forward-filtering, backward-sampling to draw samples.
 
     Args:
