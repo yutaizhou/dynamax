@@ -6,6 +6,7 @@ import jax.random as jr
 
 from jax.tree_util import tree_map
 from jax.scipy.stats import norm
+import pytest
 from scipy.stats import invgamma
 from tensorflow_probability.substrates import jax as tfp
 
@@ -41,7 +42,8 @@ def test_inverse_wishart_log_prob(df=7.0, dim=3, scale_factor=3.0, n_samples=10)
     assert jnp.all(jnp.isfinite(lps))
 
 
-def test_inverse_wishart_sample(df=7.0, dim=3, scale_factor=3.0, n_samples=10000, num_std=6):
+@pytest.mark.parametrize("dim", [2, 3, 4])
+def test_inverse_wishart_sample(dim, df=7.0, scale_factor=3.0, n_samples=10000, num_std=6):
     """Test that the sample mean is within a (large) interval around the true mean.
     To determine the interval to 6 times the standard deviation of the Monte
     Carlo estimator.
@@ -56,6 +58,58 @@ def test_inverse_wishart_sample(df=7.0, dim=3, scale_factor=3.0, n_samples=10000
 
     mc_std = jnp.sqrt(iw.variance() / n_samples)
     assert jnp.allclose(samples.mean(axis=0), iw.mean(), atol=num_std * mc_std)
+
+def test_inverse_wishart_variance_vectorization():
+    """Test the vectorization of marginal variance calculation."""
+    p = 3
+    # Vectorize over two inverse-Wishart distributions.
+    Ψ1 = jnp.array([[ 3.915627  ,  0.05046278, -0.7466818 ],
+       [ 0.05046278,  5.368932  , -0.57225686],
+       [-0.7466818 , -0.57225686,  3.162733  ]], dtype=jnp.float32)
+    𝜈1 = 7.5  # >p + 3
+    Ψ2 = jnp.array([[ 4.3864717, -0.8869951, -0.9199044],
+       [-0.8869951,  5.07704  , -0.8494578],
+       [-0.9199044, -0.8494578,  4.1288185]], dtype=jnp.float32)
+    𝜈2 = 8.0  # >p + 3
+    assert all(jnp.linalg.eigvals(Ψ1) > 0)
+    assert all(jnp.linalg.eigvals(Ψ2) > 0)
+
+    # Make a (2, 1) batch shape to test vectorization over >1 leading axis.
+    𝜈 = jnp.stack([𝜈1, 𝜈2]) # Shape: (2,)
+    𝜈 = 𝜈[:, None]  # Shape: (2, 1)
+    Ψ = jnp.stack([Ψ1, Ψ2])  # Shape: (2, 3, 3)
+    Ψ = Ψ[:, None]  # Shape: (2, 1, 3, 3)
+    variance_composite = InverseWishart(df=𝜈, scale=Ψ).variance()
+    assert variance_composite.shape[-2:] == (p, p)
+
+    # Verify that vectorized and non-vectorized calculation gives the same variance.
+    variance1 = InverseWishart(df=𝜈1, scale=Ψ1).variance()
+    variance2 = InverseWishart(df=𝜈2, scale=Ψ2).variance()
+    jnp.allclose(variance_composite[0, 0], variance1)
+    jnp.allclose(variance_composite[1, 0], variance2)
+
+def test_inverse_wishart_sample_non_diagonal_scale(n_samples: int = 10_000, num_std=3):
+    """Test sample mean of an inverse-Wishart distr. w/ non-diagonal scale matrix."""
+    k = 2
+    𝜈 = 5.5  # 𝜈 > k
+    Ψ = jnp.array([[20.712932, 25.124634],
+        [25.124634, 32.814785]], dtype=jnp.float32)  # k x k
+    Ψ_diag = jnp.diagonal(Ψ)
+    assert all(jnp.linalg.eigvals(Ψ) > 0)  # Is positive definite.
+
+    iw = InverseWishart(df=𝜈, scale=Ψ)
+    Σs = iw.sample(sample_shape=n_samples, seed=jr.key(42))
+    actual_Σ_avg = jnp.mean(Σs, axis=0)
+
+    # Closed form expression of mean.
+    true_Σ_avg = Ψ / (𝜈 - k - 1)
+    # Closed form expression of variance.
+    numerator = (𝜈 - k + 1) * Ψ**2 + (𝜈 - k - 1) * jnp.outer(Ψ_diag, Ψ_diag)
+    denominator = (𝜈 - k) * (𝜈 - k - 1)**2 * (𝜈 - k - 3)
+    true_Σ_var = numerator / denominator
+
+    mc_std = jnp.sqrt(true_Σ_var / n_samples)
+    assert jnp.allclose(actual_Σ_avg, true_Σ_avg, atol=num_std * mc_std)
 
 
 def test_normal_inverse_wishart_mode(loc=0., mean_conc=1.0, df=7.0, dim=3, scale_factor=3.0):
